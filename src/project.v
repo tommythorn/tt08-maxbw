@@ -30,8 +30,8 @@ module tt_um_tommythorn_maxbw (
 
   assign uo_out = out;
 
-  always @(negedge clk) in_lo <= ui_in;
+  always @(negedge clk) in_lo <= {uio_in, ui_in};
   always @(posedge clk) in_lo_r <= in_lo_r;
-  always @(posedge clk) in_hi <= ui_in;
+  always @(posedge clk) in_hi <= {uio_in, ui_in};
   always @(posedge clk) out <= in_hi[15:8] ^ in_hi[7:0] ^ in_lo_r[15:8] ^ in_lo_r[7:0];  // out = F(in)
 endmodule

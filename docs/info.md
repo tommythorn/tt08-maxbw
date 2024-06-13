@@ -9,11 +9,13 @@ You can also include images in this folder and reference them in the markdown. E
 
 ## How it works
 
-Explain how your project works
+All bidirectional IOs are used as inputs.  The total 16 inputs are
+sampled at both clock edges (DDR).  Every posedge of clock, the
+resulting 32-bit are reduced to 8-bit (some xor combination).
 
 ## How to test
 
-Explain how to use your project
+Drive it with a very dedicated test bench (TBD).
 
 ## External hardware
 
