@@ -44,9 +44,11 @@ module tt_um_tommythorn_maxbw (
     else
       out <= 0;
 
+`ifdef SIM
    initial
      $monitor("%05d  clk %d rst# %d  in %x,%x  out %x   in_lo %x in_hi %x",
 	      $time,
 	      clk, rst_n, uio_in, ui_in, uo_out,
 	      in_lo, in_hi);
+`endif
 endmodule
