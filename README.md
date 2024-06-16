@@ -1,41 +1,67 @@
 ![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
 
-# Tiny Tapeout Verilog Project Template
+# MaxBW
 
-- [Read the documentation for project](docs/info.md)
+This design is a small testbed and proof-of-concept of part of MaxBW.
 
-## What is Tiny Tapeout?
+MaxBW (named in honor of Max Born W) is an simple but high performance
+core-uncore interconnect, supporting split transaction packetized
+memory traffic.  Inspirations include Hypertransport and PCIe.  The
+main purpose of MaxBW is to enable the core to issue read and write
+requests to the uncore for which replies may come with arbitrary
+latency and possibly not in the same order as the requests.
 
-Tiny Tapeout is an educational project that aims to make it easier and cheaper than ever to get your digital and analog designs manufactured on a real chip.
+MaxBW is split into low-level serialized packet transport and
+high-level packet protocol.  Both are (largely) independent of the
+other and can be replaced.
 
-To learn more and get started, visit https://tinytapeout.com.
+## Packet Transport
 
-## Set up your Verilog project
+   (picture of core and uncore, with an ingress and egress channel
+   between them.  Each has a few messages with some idle packets as
+   well.  Packet in the egress channel have tags in-order, which as
+   the ingress channel have some replies reordered.  All tags are
+   unique).
 
-1. Add your Verilog files to the `src` folder.
-2. Edit the [info.yaml](info.yaml) and update information about your project, paying special attention to the `source_files` and `top_module` properties. If you are upgrading an existing Tiny Tapeout project, check out our [online info.yaml migration tool](https://tinytapeout.github.io/tt-yaml-upgrade-tool/).
-3. Edit [docs/info.md](docs/info.md) and add a description of your project.
-4. Adapt the testbench to your design. See [test/README.md](test/README.md) for more information.
+The Packet Transport consists of an egress and an ingress channel.
+For each, it's responsible for detecting the start of a new packet and
+the collection of the bits, to be presented to the Packet Protocol
+layer.
 
-The GitHub action will automatically build the ASIC files using [OpenLane](https://www.zerotoasiccourse.com/terminology/openlane/).
+   (picture of a packet, with header broken into fields, followed by
+   payload.  Maybe show both load and store requests, and a load
+   reply).
 
-## Enable GitHub actions to build the results page
+All packets are 16-bit aligned¹ and are prefixed with a non-zero
+16-bit header¹ which includes the packet size (without header) in
+16-bit quantities (0..31¹).  Empty channels transmit the idle message,
+which is an all zero bit pattern (thus we can always detect the start
+of a new packet after idle).
 
-- [Enabling GitHub Pages](https://tinytapeout.com/faq/#my-github-action-is-failing-on-the-pages-part)
+The sample implementation in this design maximizes read bandwidth
+using a 16 input bits and 8 output bits. Due to Sky130 IO constraints,
+only the inputs can be DDR encoded, thus nominally 66*4=264 MB/s
+ingress and 66 MB/s egress.
 
-## Resources
+## Packet Protocol
 
-- [FAQ](https://tinytapeout.com/faq/)
-- [Digital design lessons](https://tinytapeout.com/digital_design/)
-- [Learn how semiconductors work](https://tinytapeout.com/siliwiz/)
-- [Join the community](https://tinytapeout.com/discord)
-- [Build your design locally](https://www.tinytapeout.com/guides/local-hardening/)
+Commands and replies are paired using a unique small id (< 16¹).  The
+id is released for reuse once its reply is received.  Thus tags play a
+double role: reassociating replies with request and acting as credits
+for flow control. [As presented even writes are acknowledged with a
+reply.  An alternative options uses a different mechanism to
+acknowledge posted writes, but that's necessarily more complicated.
+TBD.]
 
-## What next?
+In addition to the payload size and the tag, the header contains the
+command and auxiliary payload bits.
 
-- [Submit your design to the next shuttle](https://app.tinytapeout.com/).
-- Edit [this README](README.md) and explain your design, how it works, and how to test it.
-- Share your project on your social network of choice:
-  - LinkedIn [#tinytapeout](https://www.linkedin.com/search/results/content/?keywords=%23tinytapeout) [@TinyTapeout](https://www.linkedin.com/company/100708654/)
-  - Mastodon [#tinytapeout](https://chaos.social/tags/tinytapeout) [@matthewvenn](https://chaos.social/@matthewvenn)
-  - X (formerly Twitter) [#tinytapeout](https://twitter.com/hashtag/tinytapeout) [@tinytapeout](https://twitter.com/tinytapeout)
+   | aux:4 | tag:4 | cmd:3 | size:5 |¹²
+
+## Footnotes
+
+¹ Constants are subject to change in future revisions
+
+² It is desirable to minimize the packet semantic in the Transport
+  layer, but arguebly combining cmd and size allows for a denser
+  encoding.  TBD.
