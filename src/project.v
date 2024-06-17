@@ -52,3 +52,66 @@ module tt_um_tommythorn_maxbw (
 	      in_lo, in_hi);
 `endif
 endmodule
+
+// XXX this could be parametrized...
+
+// XXX Currently requiring that DDR packets are a multiple of 32b
+// and only starts on posedges.
+module deserialize16DDR (
+    input  wire        clock,
+    input  wire        reset,
+    input  wire [15:0] ser_in_ddr,
+
+    output reg         packet_valid,
+    output reg         packet_is_header,
+    output reg  [31:0] packet,
+);
+
+   // DDR input: two sample flops
+   // Low part sampled on rising edge, high part on falling edge
+   reg [ 7:0]	       out;
+
+   reg [ 4:0]	       packet_words_left;
+
+   // Header | aux:4 | tag:4 | cmd:3 | size:5 |
+
+   always @(posedge clock) in_lo <= ser_in_ddr;
+   always @(negedge clock) in_hi <= ser_in_ddr;
+
+   always @(posedge clock) packet_valid     <= !reset && in_lo != 0 || packet_words_left != 0;
+   always @(posedge clock) packet_is_header <= !reset && in_lo != 0 && packet_words_left == 0;
+   always @(posedge clock) if (reset)
+     packet_words_left <= 0;
+   else if (packet_words_left != 0)
+     // In the middle of a packet with `packet_words_left` of payload left
+     packet_words_left <= packet_words_left - 1;
+   else if (in_lo != 0 && packet_words_left == 0)
+     // We have a new header, collect the size
+     packet_words_left <= in_lo[4:0];
+   always @(posedge clock) packet <= {in_hi,in_lo};
+endmodule
+
+// XXX Currently requiring that DDR packets are a multiple of 32b
+// and only starts on posedges.
+module serialize8SDR (
+    input wire	      clock,
+    input wire	      reset,
+
+    input wire	      valid,
+    input wire [ 1:0] packet_size,
+    input wire [31:0] packet_header,
+    input wire [31:0] packet_payload0,
+    input wire [31:0] packet_payload1,
+    input wire [31:0] packet_payload2,
+    input wire [31:0] packet_payload3,
+
+    output wire       ready,
+    output reg [7:0]  ser_out_sdr,
+);
+
+   reg [ 4:0]	       packet_words_left;
+
+   ....
+endmodule
+
+// + deserialize8SDR & serialize16DDR for a test reg
