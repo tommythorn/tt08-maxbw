@@ -1,27 +1,52 @@
-![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
+![](../../workflows/gds/badge.svg)
+![](../../workflows/docs/badge.svg)
+![](../../workflows/test/badge.svg)
+![](../../workflows/fpga/badge.svg)
+
+# (Questions still under investigations)
+
+In conflict: separate cmd/type and length, large payloads, dense
+encoding, address prefix compression.
+
+Replies and commands have very different needs.  Reply payloads are 0
+or 2ⁿ bytes (for n in 0..6).  Command payloads can be quite varied
+with 0 to 8+64 = 72 bytes (for a cacheline write on a 64b system).
+
+Without considering address prefix compression and assuming 32-bit
+addressing, we have payloads of 0 or 2ⁿ bytes (for n in 0..6) size +
+addresses (the width is part of the command).
+
+*WITH* address prefix compression we have to account for different
+length addresses -- this is hard but also important
 
 # MaxBW
 
-This design is a small testbed and proof-of-concept of part of MaxBW.
+MaxBW is a PCIe/Hypertransport inspired split transaction packetized
+memory bus with the following characteristics
 
-MaxBW (named in honor of Max Born W) is an simple but high performance
-core-uncore interconnect, supporting split transaction packetized
-memory traffic.  Inspirations include Hypertransport and PCIe.  The
-main purpose of MaxBW is to enable the core to issue read and write
-requests to the uncore for which replies may come with arbitrary
-latency and possibly not in the same order as the requests.
+* fully asynchronous (no fixed latency between commands and replies)
+* minimal overhead (one byte header for commands and replies)
+* self-synchronizing (idle channels always transmits aligned idle
+  packets)
+* supports reply reordering (within a small window)
+* flow-control via pause/resume (AKA Xoff/Xon) replies
+* [address prefix compression -- TBD]
 
-MaxBW is split into low-level serialized packet transport and
-high-level packet protocol.  Both are (largely) independent of the
-other and can be replaced.
+Best case: 64/65 = 98.5% efficient for 64 byte cache loads on byte
+aligned channels
+
+Worst case: 25% efficient on byte loads on 32 bit aligned channels
+
+Commands: Idle, Sync, Write(width,addr,data), Read(width,addr)
+
+Replies: Idle, Synced, Pause, Resume, Data(seqdelta,data)
 
 ## Packet Transport
 
    (picture of core and uncore, with an ingress and egress channel
-   between them.  Each has a few messages with some idle packets as
-   well.  Packet in the egress channel have tags in-order, which as
-   the ingress channel have some replies reordered.  All tags are
-   unique).
+   between them.  Each has a few packets, some of which are idle.
+   Packet in the egress channel have tags in-order, which as the
+   ingress channel have some replies reordered).
 
 The Packet Transport consists of an egress and an ingress channel.
 For each, it's responsible for detecting the start of a new packet and
@@ -29,39 +54,27 @@ the collection of the bits, to be presented to the Packet Protocol
 layer.
 
    (picture of a packet, with header broken into fields, followed by
-   payload.  Maybe show both load and store requests, and a load
-   reply).
+   payload.  Maybe show both Read/Write commands and a Data reply).
 
-All packets are 16-bit aligned¹ and are prefixed with a non-zero
-16-bit header¹ which includes the packet size (without header) in
-16-bit quantities (0..31¹).  Empty channels transmit the idle message,
-which is an all zero bit pattern (thus we can always detect the start
-of a new packet after idle).
+A packet is sequence of bytes, the header followed by the payload.
+Packets are transmitted on channels with a power-of-two byte width
+(typically 1, 2, or 4 bytes).
 
-The sample implementation in this design maximizes read bandwidth
-using a 16 input bits and 8 output bits. Due to Sky130 IO constraints,
-only the inputs can be DDR encoded, thus nominally 66*4=264 MB/s
-ingress and 66 MB/s egress.
+The packet header encoding is still *TBD* but encodes the payload
+length and the command or reply type respectively.  The reply payload
+can be 0, 1, 2, 4, 8, 16, 32, or 64 bytes.
+
+The implementation in this design uses an SDR encoded byte channel for
+commands (thus 66 MB/s at 66 MHz) and a DDR encoded 16-bit channel for
+replies (thus 66*4=264 MB/s at 66 MHz).
 
 ## Packet Protocol
 
-Commands and replies are paired using a unique small id (< 16¹).  The
-id is released for reuse once its reply is received.  Thus tags play a
-double role: reassociating replies with request and acting as credits
-for flow control. [As presented even writes are acknowledged with a
-reply.  An alternative options uses a different mechanism to
-acknowledge posted writes, but that's necessarily more complicated.
-TBD.]
+There are four commands: Idle, Sync, Write(size,address,data), and
+Read(size,address).  Write messages are unacknowledged.  Read command
+are, eventually, fulfilled by a Data reply with read data as the
+payload.  To support reply reordering, Data replies include a small
+reorder delta.  Sync is a barrier for all read and write commands
+which block until all preceeding commands have been processed.
 
-In addition to the payload size and the tag, the header contains the
-command and auxiliary payload bits.
-
-   | aux:4 | tag:4 | cmd:3 | size:5 |¹²
-
-## Footnotes
-
-¹ Constants are subject to change in future revisions
-
-² It is desirable to minimize the packet semantic in the Transport
-  layer, but arguebly combining cmd and size allows for a denser
-  encoding.  TBD.
+Replies are: Idle, Synced, Pause, Resume, and Data(delta,payload).
