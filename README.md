@@ -3,22 +3,6 @@
 ![](../../workflows/test/badge.svg)
 ![](../../workflows/fpga/badge.svg)
 
-# (Questions still under investigations)
-
-In conflict: separate cmd/type and length, large payloads, dense
-encoding, address prefix compression.
-
-Replies and commands have very different needs.  Reply payloads are 0
-or 2ⁿ bytes (for n in 0..6).  Command payloads can be quite varied
-with 0 to 8+64 = 72 bytes (for a cacheline write on a 64b system).
-
-Without considering address prefix compression and assuming 32-bit
-addressing, we have payloads of 0 or 2ⁿ bytes (for n in 0..6) size +
-addresses (the width is part of the command).
-
-*WITH* address prefix compression we have to account for different
-length addresses -- this is hard but also important
-
 # MaxBW
 
 MaxBW is a PCIe/Hypertransport inspired split transaction packetized
@@ -30,7 +14,7 @@ memory bus with the following characteristics
   packets)
 * supports reply reordering (within a small window)
 * flow-control via pause/resume (AKA Xoff/Xon) replies
-* [address prefix compression -- TBD]
+* address prefix compression
 
 Best case: 64/65 = 98.5% efficient for 64 byte cache loads on byte
 aligned channels
@@ -43,15 +27,14 @@ Replies: Idle, Synced, Pause, Resume, Data(seqdelta,data)
 
 ## Packet Transport
 
-   (picture of core and uncore, with an ingress and egress channel
-   between them.  Each has a few packets, some of which are idle.
-   Packet in the egress channel have tags in-order, which as the
-   ingress channel have some replies reordered).
+   (picture of core and uncore, with a command and reply channel
+   between them.  Each has a few packets, some of which are idle.  The
+   is an assortment of sizes, examples of address compression, and
+   some packet in the reply have replies reordered).
 
-The Packet Transport consists of an egress and an ingress channel.
-For each, it's responsible for detecting the start of a new packet and
-the collection of the bits, to be presented to the Packet Protocol
-layer.
+The Packet transport consists of a command and a reply channel.  For
+each, it's responsible for detecting the start of a new packet and the
+collection of the bits, to be presented to the Packet Protocol layer.
 
    (picture of a packet, with header broken into fields, followed by
    payload.  Maybe show both Read/Write commands and a Data reply).
@@ -60,9 +43,10 @@ A packet is sequence of bytes, the header followed by the payload.
 Packets are transmitted on channels with a power-of-two byte width
 (typically 1, 2, or 4 bytes).
 
-The packet header encoding is still *TBD* but encodes the payload
-length and the command or reply type respectively.  The reply payload
-can be 0, 1, 2, 4, 8, 16, 32, or 64 bytes.
+The packet header encoding, detailed below, encodes the payload length
+and the command or reply type respectively.  The reply payload can be
+0, 1, 2, 4, 8, 16, 32, or 64 bytes.  Commands further more includes 1,
+2, 4, or 8 bytes or address (expect for command 0).
 
 The implementation in this design uses an SDR encoded byte channel for
 commands (thus 66 MB/s at 66 MHz) and a DDR encoded 16-bit channel for
@@ -78,3 +62,77 @@ reorder delta.  Sync is a barrier for all read and write commands
 which block until all preceeding commands have been processed.
 
 Replies are: Idle, Synced, Pause, Resume, and Data(delta,payload).
+
+
+## Reply Header Encoding
+
+Reply headers are 8-bit encoded as two packed fields: `type:5
+datasz:3`.  The datasz maps to 0, 1, 2, 4, .., 64 bytes of following
+data payload.
+
+Type is one of Idle, Synced, Pause, Resume, Data(tagdelta), for
+tagdelta in -16..15.  As Data isn't valid for a payload of 0, Idle,
+Synced, Pause, and Resume are mapped onto the tagdelta.
+
+To enable reply reordering, commands and replies are tagged, but
+implicitly to optimize header density.  The first package after a Sync
+(Synced) command (reply) is implicitly tagged 0, with sequentially
+increasing tags after that.  However, reply tags are formed by
+applying the associated offset first.
+
+Example: reply 5 is delayed until after reply 7, thus we'd see .. R3
+R4 R6 R7 R5 R8 ... which would be encoded as .. R+0 R+0 R+1 R+1 R-2
+R+0 ...  The limited range of tag delta reflects the maximally allowed
+reordering.
+
+In summany, the header mapping:
+
+| 8-bit value | meaning                         |
+|-------------|---------------------------------|
+| 0           | Idle                            |
+| 1           | Synced                          |
+| 2           | Pause                           |
+| 3           | Resume                          |
+| ...         |                                 |
+| 32          | 1B Data, in-order (tag delta 0) |
+| 33          | 1B Data, tag delta 1            |
+| ..          |                                 |
+| 47          | 1B Data, tag delta 15           |
+| 48          | 1B Data, tag delta -16          |
+| ...         |                                 |
+| 64          | 2B Data, tag delta 0            |
+| ..          |                                 |
+| 96          | 4B Data, tag delta 0            |
+| ..          |                                 |
+
+
+### Command Headers
+
+Commands are primarily read and write, which both includes (part of)
+and address and, for write, a data payload.  Thus, the size encoding
+is more complicated.  The header encodes an address size and a data
+size, and the payload is the sum of these.
+
+The 8-bit header is broken into three fields `type:3 addrsz:2
+datasz:3`.  The datasz mapping is the same as for replies, but addrsz
+maps to 1,2,4, or 8 bytes of address, except for type 0 which has no
+address bytes and the field is ignored.
+
+The type mapping depends on datasz:
+
+| type, addrsz, datasz | meaning             |
+|----------------------|---------------------|
+| 0, 0, 0              | Idle                |
+| 0, 1, 0              | Sync                |
+| t, _, 0              | ReadX, X = 2^(t-1)  |
+| t, _, _              | WriteX, X = 2^(t-1) |
+
+### Address Prefix Compression
+
+We allow a full 64-bit address, but we don't want to pay the overhead
+of this.  To avoid this, Read and Write commands come in four
+different variants: 1B, 2B, 4B, and 8B, where the first three only
+sets the lower 8-, 16-, or 32-bits while reusing the rest from the
+most recent Read and Write command respectively.  The "previous value"
+is reset to 0 by the Sync command and a address is maintained
+separately for Read and Write commands to avoid thrashing contexts.
