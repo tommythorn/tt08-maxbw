@@ -124,8 +124,8 @@ The type mapping depends on datasz:
 |----------------------|---------------------|
 | 0, 0, 0              | Idle                |
 | 0, 1, 0              | Sync                |
-| t, _, 0              | ReadX, X = 2^(t-1)  |
-| t, _, _              | WriteX, X = 2^(t-1) |
+| n, _, 0              | ReadX, X = 2ⁿ⁻¹  |
+| n, _, _              | WriteX, X = 2ⁿ⁻¹ |
 
 ### Address Prefix Compression
 
