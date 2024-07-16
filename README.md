@@ -136,3 +136,7 @@ sets the lower 8-, 16-, or 32-bits while reusing the rest from the
 most recent Read and Write command respectively.  The "previous value"
 is reset to 0 by the Sync command and a address is maintained
 separately for Read and Write commands to avoid thrashing contexts.
+
+(With a change to instead track last read/written address + 1, we
+could introduce a 0 address option which would save a byte for some
+commands. It would be a fair bit of additional complexity.)
