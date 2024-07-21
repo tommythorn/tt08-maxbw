@@ -1,4 +1,4 @@
-mod encoding;
+//mod encoding;
 use rand::Rng;
 
 use std::collections::VecDeque;
@@ -11,6 +11,7 @@ enum Command {
     Sync,
     Write(u64, Vec<u8>), // XXX Width can only be 1, 2, 4, ..., 64; we could enforce with types
     Read(u8, u64),       // XXX Width can only be 1, 2, 4, ..., 64; we could enforce with types
+    Stop,                // Sim-only
 }
 
 #[derive(Debug)]
@@ -22,8 +23,8 @@ enum Reply {
     Data(i8, Vec<u8>),
 }
 
-fn send<T: std::fmt::Debug>(tx: &Sender<T>, msg: T) {
-    println!("Sending {msg:?}");
+fn send<T: std::fmt::Debug>(prefix: &str, tx: &Sender<T>, msg: T) {
+    println!("{prefix}Sending {msg:?}");
     tx.send(msg).unwrap();
 }
 
@@ -31,48 +32,56 @@ fn try_receive<T>(rx: &Receiver<T>) -> Result<T, TryRecvError> {
     rx.try_recv()
 }
 
+fn receive<T>(rx: &Receiver<T>) -> T {
+    rx.recv().unwrap()
+}
+
 fn main() {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (reply_tx, reply_rx) = mpsc::channel();
-
-    // Let's spawn the client (~ CPU)
-    thread::spawn(move || run_client(cmd_tx, reply_rx));
-    run_memory_server(cmd_rx, reply_tx);
+    thread::spawn(move || memory_server(cmd_rx, reply_tx));
+    client(cmd_tx, reply_rx);
 }
 
-fn run_client(cmd_tx: Sender<Command>, reply_rx: Receiver<Reply>) {
+fn client(cmd_tx: Sender<Command>, reply_rx: Receiver<Reply>) {
     let mut pending = VecDeque::new();
     let mut tag = 0;
     let mut paused = false;
 
     // Sending idle isn't required but reflects what would happen on hardware
-    send(&cmd_tx, Command::Idle);
+    send("\t<- client  ", &cmd_tx, Command::Idle);
 
     // We need to start out in a known state
-    send(&cmd_tx, Command::Sync);
-    while let Ok(reply) = try_receive(&reply_rx) {
-        if matches!(reply, Reply::Synced) {
-            break;
-        }
-    }
+    send("\t<- client  ", &cmd_tx, Command::Sync);
+    while !matches!(receive(&reply_rx), Reply::Synced) {}
 
     let mut n = 1;
     loop {
-        if n < 10 && !paused {
-            let magic_number = rand::thread_rng().gen_range(1..14);
-            let is_read = magic_number % 2 == 0;
-            let length = 1 << (magic_number / 2);
-            let cmd = if is_read {
-                Command::Read(length, 42 + magic_number)
-            } else {
-                Command::Write(42 + magic_number, vec![42u8; length.into()])
-            };
-            send(&cmd_tx, cmd);
-            pending.push_front(n);
-            println!("  push, now: {pending:?}");
-            n += 1;
+        if n < 10 {
+            if !paused {
+                let magic_number = rand::thread_rng().gen_range(1..14);
+                let is_read = magic_number % 2 == 0;
+                let length = 1 << (magic_number / 2);
+                if is_read {
+                    send(
+                        "\t<- client  ",
+                        &cmd_tx,
+                        Command::Read(length, 42 + magic_number),
+                    );
+                    pending.push_front(n);
+                    n += 1;
+                    println!("  push, now: {pending:?}");
+                } else {
+                    send(
+                        "\t<- client  ",
+                        &cmd_tx,
+                        Command::Write(42 + magic_number, vec![42u8; length.into()]),
+                    );
+                }
+            }
         } else {
-            panic!("stop");
+            send("\t<- client  ", &cmd_tx, Command::Stop);
+            return;
         }
 
         // Handing any replies coming back
@@ -93,38 +102,52 @@ fn run_client(cmd_tx: Sender<Command>, reply_rx: Receiver<Reply>) {
                 }
                 Reply::Data(delta, data) => {
                     let this = tag + delta as i32;
-                    println!("Client: got #{this} {data:?}");
-                    println!("  popping from: {pending:?}");
+                    println!("\tClient: got #{this} {}", data.len());
+                    //                println!("  popping from: {pending:?}");
                     pending.pop_back().unwrap();
                     tag += 1;
                 }
             }
         }
-        thread::sleep(std::time::Duration::from_millis(100)); // block for 0.1 seconds
+        // thread::sleep(std::time::Duration::from_millis(100)); // block for 0.1 seconds
     }
 }
 
-fn run_memory_server(cmd_rx: Receiver<Command>, reply_tx: Sender<Reply>) {
+fn memory_server(cmd_rx: Receiver<Command>, reply_tx: Sender<Reply>) {
     let mut tag = 0;
     //let mut pending_loads = VecDeque::new();
 
     // Sending idle isn't required but reflects what would happen on hardware
-    send(&reply_tx, Reply::Idle);
+    send("server ->  ", &reply_tx, Reply::Idle);
 
+    let mut pause_requested = false;
     loop {
-        match try_receive(&cmd_rx) {
+        let magic_number = rand::thread_rng().gen_range(1..14000);
+        if magic_number == 7 {
+            if pause_requested {
+                send("server ->  ", &reply_tx, Reply::Resume);
+            } else {
+                send("server ->  ", &reply_tx, Reply::Pause);
+            }
+            pause_requested = !pause_requested;
+        }
+
+        match Ok(receive(&cmd_rx)) {
             Ok(Command::Idle) => {}
             Ok(Command::Sync) => {
                 tag = 0;
                 // pending.flush
-                send(&reply_tx, Reply::Synced);
+                send("server ->  ", &reply_tx, Reply::Synced);
             }
             Ok(Command::Write(a, d)) => {
-                println!("Server: write {d:x?} to {a:x}");
+                println!("server ->  write {d:x?} to {a:x}");
             }
             Ok(Command::Read(_w, _a)) => {
-                send(&reply_tx, Reply::Data(0, vec![0u8]));
+                send("server -> c ", &reply_tx, Reply::Data(0, vec![0u8]));
                 tag += 1;
+            }
+            Ok(Command::Stop) => {
+                return;
             }
             Err(TryRecvError::Empty) => {}
             Err(e) => {
