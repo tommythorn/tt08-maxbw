@@ -5,6 +5,40 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
+struct Endpoint<S: std::fmt::Debug, R: std::fmt::Debug> {
+    tx: Sender<S>,
+    rx: Receiver<R>,
+    id: String,
+}
+
+impl<S: std::fmt::Debug, R: std::fmt::Debug> Endpoint<S, R> {
+    fn new(tx: Sender<S>, rx: Receiver<R>, id: String) -> Self {
+        Self { tx, rx, id }
+    }
+
+    fn send(&self, msg: S) {
+        println!("{}:{msg:?} ->", self.id);
+        self.tx.send(msg).unwrap();
+    }
+
+    fn log_received(&self, v: &R) {
+        println!("{}: <- {v:?}", self.id);
+    }
+    fn try_receive(&self) -> Result<R, TryRecvError> {
+        let r = self.rx.try_recv();
+        if let Ok(v) = &r {
+            self.log_received(v);
+        }
+        r
+    }
+
+    fn receive(&self) -> R {
+        let v = self.rx.recv().unwrap();
+        self.log_received(&v);
+        v
+    }
+}
+
 #[derive(Debug)]
 enum Command {
     Idle,
@@ -23,75 +57,59 @@ enum Reply {
     Data(i8, Vec<u8>),
 }
 
-fn send<T: std::fmt::Debug>(prefix: &str, tx: &Sender<T>, msg: T) {
-    println!("{prefix}Sending {msg:?}");
-    tx.send(msg).unwrap();
-}
-
-fn try_receive<T>(rx: &Receiver<T>) -> Result<T, TryRecvError> {
-    rx.try_recv()
-}
-
-fn receive<T>(rx: &Receiver<T>) -> T {
-    rx.recv().unwrap()
-}
-
 fn main() {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (reply_tx, reply_rx) = mpsc::channel();
-    thread::spawn(move || memory_server(cmd_rx, reply_tx));
-    client(cmd_tx, reply_rx);
+    let client_channels = Endpoint::new(cmd_tx, reply_rx, "client".into());
+    let server_channels = Endpoint::new(reply_tx, cmd_rx, "server".into());
+    thread::spawn(move || memory_server(server_channels));
+    client(client_channels);
 }
 
-fn client(cmd_tx: Sender<Command>, reply_rx: Receiver<Reply>) {
+fn client(ep: Endpoint<Command, Reply>) {
     let mut pending = VecDeque::new();
-    let mut tag = 0;
+    let mut read_tag = 0;
+    let mut data_tag = 0;
     let mut paused = false;
 
     // Sending idle isn't required but reflects what would happen on hardware
-    send("\t<- client  ", &cmd_tx, Command::Idle);
+    ep.send(Command::Idle);
 
     // We need to start out in a known state
-    send("\t<- client  ", &cmd_tx, Command::Sync);
-    while !matches!(receive(&reply_rx), Reply::Synced) {}
+    ep.send(Command::Sync);
+    while !matches!(ep.receive(), Reply::Synced) {}
 
     let mut n = 1;
     loop {
         if n < 10 {
             if !paused {
-                let magic_number = rand::thread_rng().gen_range(1..14);
+                let magic_number = rand::thread_rng().gen_range(1..6);
                 let is_read = magic_number % 2 == 0;
                 let length = 1 << (magic_number / 2);
                 if is_read {
-                    send(
-                        "\t<- client  ",
-                        &cmd_tx,
-                        Command::Read(length, 42 + magic_number),
-                    );
-                    pending.push_front(n);
+                    ep.send(Command::Read(length, 42 + magic_number));
+                    pending.push_front(read_tag);
                     n += 1;
+                    read_tag += 1;
                     println!("  push, now: {pending:?}");
                 } else {
-                    send(
-                        "\t<- client  ",
-                        &cmd_tx,
-                        Command::Write(42 + magic_number, vec![42u8; length.into()]),
-                    );
+                    ep.send(Command::Write(42 + magic_number, vec![1u8; length.into()]));
                 }
             }
         } else {
-            send("\t<- client  ", &cmd_tx, Command::Stop);
+            ep.send(Command::Stop);
             return;
         }
 
         // Handing any replies coming back
-        for reply in reply_rx.try_iter() {
+        while let Ok(reply) = ep.try_receive() {
             match reply {
                 Reply::Idle => {}
                 Reply::Synced => {
                     println!("  syncing");
                     pending = VecDeque::new(); // XXX flush method?
-                    tag = 0;
+                    read_tag = 0;
+                    data_tag = 0;
                     paused = false;
                 }
                 Reply::Pause => {
@@ -101,11 +119,12 @@ fn client(cmd_tx: Sender<Command>, reply_rx: Receiver<Reply>) {
                     paused = false;
                 }
                 Reply::Data(delta, data) => {
-                    let this = tag + delta as i32;
+                    let this = data_tag + delta as i32;
                     println!("\tClient: got #{this} {}", data.len());
                     //                println!("  popping from: {pending:?}");
-                    pending.pop_back().unwrap();
-                    tag += 1;
+                    let expected_tag = pending.pop_back().unwrap();
+                    assert_eq!(this, expected_tag);
+                    data_tag += 1;
                 }
             }
         }
@@ -113,37 +132,35 @@ fn client(cmd_tx: Sender<Command>, reply_rx: Receiver<Reply>) {
     }
 }
 
-fn memory_server(cmd_rx: Receiver<Command>, reply_tx: Sender<Reply>) {
+fn memory_server(ep: Endpoint<Reply, Command>) {
     let mut tag = 0;
     //let mut pending_loads = VecDeque::new();
 
     // Sending idle isn't required but reflects what would happen on hardware
-    send("server ->  ", &reply_tx, Reply::Idle);
+    ep.send(Reply::Idle);
 
     let mut pause_requested = false;
     loop {
         let magic_number = rand::thread_rng().gen_range(1..14000);
         if magic_number == 7 {
             if pause_requested {
-                send("server ->  ", &reply_tx, Reply::Resume);
+                ep.send(Reply::Resume);
             } else {
-                send("server ->  ", &reply_tx, Reply::Pause);
+                ep.send(Reply::Pause);
             }
             pause_requested = !pause_requested;
         }
 
-        match Ok(receive(&cmd_rx)) {
+        match Ok(ep.receive()) {
             Ok(Command::Idle) => {}
             Ok(Command::Sync) => {
                 tag = 0;
                 // pending.flush
-                send("server ->  ", &reply_tx, Reply::Synced);
+                ep.send(Reply::Synced);
             }
-            Ok(Command::Write(a, d)) => {
-                println!("server ->  write {d:x?} to {a:x}");
-            }
+            Ok(Command::Write(_a, _d)) => { /*println!("server ->  write {d:x?} to {a:x}");*/ }
             Ok(Command::Read(_w, _a)) => {
-                send("server -> c ", &reply_tx, Reply::Data(0, vec![0u8]));
+                ep.send(Reply::Data(0, vec![0u8]));
                 tag += 1;
             }
             Ok(Command::Stop) => {
