@@ -84,22 +84,24 @@ fn client(ep: Endpoint<Command, Reply>) {
         if n < 10 {
             if !paused {
                 let magic_number = rand::thread_rng().gen_range(1..6);
-                let is_read = magic_number % 2 == 0;
+                let is_read = /*magic_number % 2 == 0*/ true;
                 let length = 1 << (magic_number / 2);
                 let a = rand::thread_rng().gen_range(1..1000u64);
                 if is_read {
                     ep.send(Command::Read(length, a));
                     pending_loads.insert(read_tag, a);
-                    n += 1;
                     read_tag += 1;
                     println!("client: pending loads: {pending_loads:?}");
                 } else {
                     ep.send(Command::Write(42 + magic_number, vec![1u8; length.into()]));
                 }
+                n += 1;
             }
         } else if pending_loads.is_empty() {
             ep.send(Command::Stop);
             return;
+        } else {
+            ep.send(Command::Idle);
         }
 
         // Handing any replies coming back
@@ -122,8 +124,13 @@ fn client(ep: Endpoint<Command, Reply>) {
                     paused = false;
                 }
                 Reply::Data(delta, data) => {
-                    let this = data_tag + delta as i32;
-                    println!("client: got #{this} {}", data.len());
+                    //let this = data_tag + delta as i32;
+                    let this = delta as i32;
+                    println!(
+                        "client: got #{this} {}  (delta {})",
+                        data.len(),
+                        this - data_tag
+                    );
                     match pending_loads.remove(&this) {
                         None => panic!("client: got data for a non-pending load #{this}"),
                         Some(a) => println!("client: got {data:?} for load from address {a}"),
@@ -138,6 +145,7 @@ fn client(ep: Endpoint<Command, Reply>) {
 
 fn memory_server(ep: Endpoint<Reply, Command>) {
     let mut tag = 0isize;
+    let mut data_tag = 0isize;
     let mut pending_loads = std::collections::BTreeMap::new();
 
     // Sending idle isn't required but reflects what would happen on hardware
@@ -167,9 +175,11 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
             let (tag2, (w, a)) = pending_loads.remove_entry(&target_load_tag).unwrap();
             assert_eq!(target_load_tag, tag2);
             println!("    server: now processing load #{target_load_tag} {w}B at {a}");
-            let delta = target_load_tag - tag + 1;
+            let delta = /*target_load_tag - tag + 1*/ target_load_tag;
             assert_eq!(delta, isize::from(delta as i8));
+            println!("    server: delta {}", target_load_tag - data_tag);
             ep.send(Reply::Data(delta as i8, vec![0u8; w as usize]));
+            data_tag += 1;
         }
         match Ok(ep.receive()) {
             Ok(Command::Idle) => {}
