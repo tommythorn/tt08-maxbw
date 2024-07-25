@@ -65,8 +65,8 @@ fn client(ep: Endpoint<Command, Reply>) {
     let mut pending_reads = vec![None; WINDOW_SIZE];
     let mut pending_reads_count = 0;
     let mut oldest_read_tag = 0;
-    let mut read_tag = 0;
-    let mut data_tag = 0;
+    let mut next_read_tag = 0;
+    let mut next_data_tag = 0;
     let mut paused = false;
 
     // Sending idle isn't required but reflects what would happen on hardware
@@ -80,15 +80,15 @@ fn client(ep: Endpoint<Command, Reply>) {
 
     let mut n = 1;
     loop {
-        if !paused && n < 100 && read_tag - oldest_read_tag < WINDOW_SIZE {
+        if !paused && n < 100 && next_read_tag - oldest_read_tag < WINDOW_SIZE {
             let is_read = rand::thread_rng().gen_range(0..100) < 66;
             let magic_number = rand::thread_rng().gen_range(1..6);
             let length = 1 << (magic_number / 2);
             let a = rand::thread_rng().gen_range(1..1000u64);
             if is_read {
-                assert!(pending_reads[read_tag % WINDOW_SIZE].is_none());
-                pending_reads[read_tag % WINDOW_SIZE] = Some(a);
-                read_tag += 1;
+                assert!(pending_reads[next_read_tag % WINDOW_SIZE].is_none()); // Can't happen
+                pending_reads[next_read_tag % WINDOW_SIZE] = Some(a);
+                next_read_tag += 1;
                 pending_reads_count += 1;
                 ep.send(Command::Read(length, a));
                 n += 1;
@@ -109,33 +109,33 @@ fn client(ep: Endpoint<Command, Reply>) {
                 pending_reads = vec![None; WINDOW_SIZE];
                 pending_reads_count = 0;
                 oldest_read_tag = 0;
-                read_tag = 0;
-                data_tag = 0;
+                next_read_tag = 0;
+                next_data_tag = 0;
                 paused = false;
             }
             Reply::Pause => paused = true,
             Reply::Resume => paused = false,
             Reply::Data(delta, data) => {
-                let this = data_tag + delta as i32;
+                let this = next_data_tag + delta as i32;
                 match pending_reads[this as usize % WINDOW_SIZE] {
                     None => panic!(
-                        "client: got data for unknown read #{this} (delta {delta}, data_tag {data_tag}"
+                        "client: got data for unknown read #{this} (delta {delta}, next_data_tag {next_data_tag}"
                     ),
                     Some(a) => {
                         println!(
                             "client: read #{this} {data:?} address {a} (delta {})",
-                            this - data_tag
+                            this - next_data_tag
                         );
                         pending_reads[this as usize % WINDOW_SIZE] = None;
                         pending_reads_count -= 1;
-                        while oldest_read_tag < read_tag
+                        while oldest_read_tag < next_read_tag
                             && pending_reads[oldest_read_tag % WINDOW_SIZE].is_none()
                         {
                             oldest_read_tag += 1;
                         }
                     }
                 }
-                data_tag += 1;
+                next_data_tag += 1;
             }
         }
     }
@@ -145,13 +145,13 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
     let mut pending_reads = vec![None; WINDOW_SIZE];
     let mut pending_reads_count = 0;
     let mut oldest_read_tag = 0;
-    let mut read_tag = 0;
-    let mut data_tag = 0;
+    let mut next_read_tag = 0;
+    let mut next_data_tag = 0;
 
     // Sending idle isn't required but reflects what would happen on hardware
     ep.send(Reply::Idle);
 
-    let mut pause_requested = false;
+    let mut pausing = false;
     'outer: loop {
         // Handle new commands
         match ep.receive() {
@@ -160,15 +160,16 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
                 pending_reads = vec![None; WINDOW_SIZE];
                 pending_reads_count = 0;
                 oldest_read_tag = 0;
-                read_tag = 0;
-                data_tag = 0;
+                next_read_tag = 0;
+                next_data_tag = 0;
                 ep.send(Reply::Synced);
             }
             Command::Write(_a, _d) => {}
             Command::Read(width, addr) => {
-                assert!(pending_reads[read_tag % WINDOW_SIZE].is_none());
-                pending_reads[read_tag % WINDOW_SIZE] = Some((width, addr));
-                read_tag += 1;
+                assert!(next_data_tag - oldest_read_tag != WINDOW_SIZE); // XXX Window overflowing is a flow-control failure
+                assert!(pending_reads[next_read_tag % WINDOW_SIZE].is_none()); // Can't happen
+                pending_reads[next_read_tag % WINDOW_SIZE] = Some((width, addr));
+                next_read_tag += 1;
                 pending_reads_count += 1;
             }
             Command::EndSim => return,
@@ -177,12 +178,8 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
         // Control Flow (XXX not correct yet)
         let magic_number = rand::thread_rng().gen_range(1..14000);
         if magic_number == 7 {
-            if pause_requested {
-                ep.send(Reply::Resume);
-            } else {
-                ep.send(Reply::Pause);
-            }
-            pause_requested = !pause_requested;
+            ep.send(if pausing { Reply::Resume } else { Reply::Pause });
+            pausing = !pausing;
         }
 
         // Service pending reads
@@ -199,12 +196,14 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
                     } else {
                         let (width, _addr) = pending_reads[target_tag % WINDOW_SIZE].unwrap();
                         pending_reads[target_tag % WINDOW_SIZE] = None;
-                        let delta = target_tag as isize - data_tag as isize;
+                        let delta = target_tag as isize - next_data_tag as isize;
+                        assert_eq!(delta, delta as i8 as isize); // Should be impossible
                         ep.send(Reply::Data(delta as i8, vec![0u8; width as usize]));
-                        data_tag += 1;
+                        next_data_tag += 1;
                         pending_reads_count -= 1;
 
-                        while oldest_read_tag < read_tag
+                        // Make room as the oldest drop out of the window
+                        while oldest_read_tag < next_read_tag
                             && pending_reads[oldest_read_tag % WINDOW_SIZE].is_none()
                         {
                             oldest_read_tag += 1;
