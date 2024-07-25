@@ -1,7 +1,6 @@
 //! Model of the MaxBW protocol
 //!
 //! Todo:
-//! - delta encode the Data tag
 //! - Array based pending lists
 //! - Flow control (to avoid overrunning buffer space and delta range)
 //! - Message serialization
@@ -111,10 +110,12 @@ fn client(ep: Endpoint<Command, Reply>) {
             Reply::Pause => paused = true,
             Reply::Resume => paused = false,
             Reply::Data(delta, data) => {
-                //let this = data_tag + delta as i32;
-                let this = delta as i32;
+                let this = data_tag + delta as i32;
                 match pending_loads.remove(&this) {
-                    None => panic!("client: got data for a non-pending load #{this}"),
+                    None => panic!(
+                        "client: got data for unknown load #{this} \
+			 (delta {delta}, data_tag {data_tag}"
+                    ),
                     Some(a) => println!(
                         "client: load #{this} {data:?} address {a} (delta {})",
                         this - data_tag
@@ -173,11 +174,12 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
             let (tag2, (w, a)) = pending_loads.remove_entry(&target_load_tag).unwrap();
             assert_eq!(target_load_tag, tag2);
             println!(
-                "\t\tserver: processing load #{target_load_tag} {w}B at {a} (delta {})",
+                "\t\tserver: processing load #{target_load_tag} {w}B at {a} \
+		 (delta {} data_tag {data_tag})",
                 target_load_tag - data_tag
             );
-            let delta = /*target_load_tag - tag + 1*/ target_load_tag;
-            assert_eq!(delta, isize::from(delta as i8));
+            let delta = target_load_tag - data_tag;
+            assert_eq!(delta, isize::from(delta as i8)); // XXX Narrow that range
             ep.send(Reply::Data(delta as i8, vec![0u8; w as usize]));
             data_tag += 1;
         } else {
