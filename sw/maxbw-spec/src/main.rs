@@ -1,7 +1,6 @@
 //! Model of the MaxBW protocol
 //!
 //! Todo:
-//! - Array based pending lists
 //! - Flow control (to avoid overrunning buffer space and delta range)
 //! - Message serialization
 
@@ -10,7 +9,7 @@ use rand::Rng;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-const WINDOW_SIZE: usize = 16; // XXX To nail down *exactly*
+const WINDOW_SIZE: usize = 16;
 
 struct Endpoint<S: std::fmt::Debug, R: std::fmt::Debug> {
     tx: Sender<S>,
@@ -120,8 +119,7 @@ fn client(ep: Endpoint<Command, Reply>) {
                 let this = data_tag + delta as i32;
                 match pending_reads[this as usize % WINDOW_SIZE] {
                     None => panic!(
-                        "client: got data for unknown read #{this} \
-			 (delta {delta}, data_tag {data_tag}"
+                        "client: got data for unknown read #{this} (delta {delta}, data_tag {data_tag}"
                     ),
                     Some(a) => {
                         println!(
@@ -144,31 +142,39 @@ fn client(ep: Endpoint<Command, Reply>) {
 }
 
 fn memory_server(ep: Endpoint<Reply, Command>) {
-    let mut tag = 0isize;
-    let mut data_tag = 0isize;
-    let mut pending_reads = std::collections::BTreeMap::new();
+    let mut pending_reads = vec![None; WINDOW_SIZE];
+    let mut pending_reads_count = 0;
+    let mut oldest_read_tag = 0;
+    let mut read_tag = 0;
+    let mut data_tag = 0;
 
     // Sending idle isn't required but reflects what would happen on hardware
     ep.send(Reply::Idle);
 
     let mut pause_requested = false;
-    loop {
+    'outer: loop {
+        // Handle new commands
         match ep.receive() {
             Command::Idle => {}
             Command::Sync => {
-                tag = 0;
+                pending_reads = vec![None; WINDOW_SIZE];
+                pending_reads_count = 0;
+                oldest_read_tag = 0;
+                read_tag = 0;
                 data_tag = 0;
-                pending_reads.clear();
                 ep.send(Reply::Synced);
             }
             Command::Write(_a, _d) => {}
-            Command::Read(w, a) => {
-                pending_reads.insert(tag, (w, a));
-                tag += 1;
+            Command::Read(width, addr) => {
+                assert!(pending_reads[read_tag % WINDOW_SIZE].is_none());
+                pending_reads[read_tag % WINDOW_SIZE] = Some((width, addr));
+                read_tag += 1;
+                pending_reads_count += 1;
             }
             Command::EndSim => return,
         }
 
+        // Control Flow (XXX not correct yet)
         let magic_number = rand::thread_rng().gen_range(1..14000);
         if magic_number == 7 {
             if pause_requested {
@@ -179,25 +185,35 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
             pause_requested = !pause_requested;
         }
 
-        if !pending_reads.is_empty() && rand::thread_rng().gen_range(0..100) < 20 {
-            /*println!(
-                "\t\tserver: {} pending reads: {:?}",
-                pending_reads.len(),
-                pending_reads
-            );*/
-            let i = rand::thread_rng().gen_range(0..pending_reads.len());
-            let target_read_tag: isize = *(pending_reads.keys().nth(i).unwrap());
-            let (tag2, (w, a)) = pending_reads.remove_entry(&target_read_tag).unwrap();
-            assert_eq!(target_read_tag, tag2);
-            println!(
-                "\t\tserver: processing read #{target_read_tag} {w}B at {a} \
-		 (delta {} data_tag {data_tag})",
-                target_read_tag - data_tag
-            );
-            let delta = target_read_tag - data_tag;
-            assert_eq!(delta, isize::from(delta as i8)); // XXX Narrow that range
-            ep.send(Reply::Data(delta as i8, vec![0u8; w as usize]));
-            data_tag += 1;
+        // Service pending reads
+        if 0 < pending_reads_count && rand::thread_rng().gen_range(0..100) < 20 {
+            let target_index = rand::thread_rng().gen_range(0..pending_reads_count);
+            let mut i = target_index;
+
+            // XXX I'm sure there's a better way
+            for j in 0..WINDOW_SIZE {
+                let target_tag = j + oldest_read_tag;
+                if pending_reads[target_tag % WINDOW_SIZE].is_some() {
+                    if 0 < i {
+                        i -= 1;
+                    } else {
+                        let (width, _addr) = pending_reads[target_tag % WINDOW_SIZE].unwrap();
+                        pending_reads[target_tag % WINDOW_SIZE] = None;
+                        let delta = target_tag as isize - data_tag as isize;
+                        ep.send(Reply::Data(delta as i8, vec![0u8; width as usize]));
+                        data_tag += 1;
+                        pending_reads_count -= 1;
+
+                        while oldest_read_tag < read_tag
+                            && pending_reads[oldest_read_tag % WINDOW_SIZE].is_none()
+                        {
+                            oldest_read_tag += 1;
+                        }
+                        continue 'outer;
+                    }
+                }
+            }
+            panic!("Found no reads? {pending_reads:?} {target_index} {oldest_read_tag}");
         } else {
             ep.send(Reply::Idle);
         }
