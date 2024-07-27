@@ -3,6 +3,7 @@
 //! Todo:
 //! - Flow control (to avoid overrunning buffer space and delta range)
 //! - Message serialization
+//! - Better code structure + unit tests
 
 //mod encoding;
 use rand::Rng;
@@ -45,10 +46,8 @@ enum Command {
 
 #[derive(Debug)]
 enum Reply {
-    Idle,
-    Synced,
-    Pause,
-    Resume,
+    Idle(u8),
+    Synced(u8),
     Data(i8, Vec<u8>),
 }
 
@@ -67,54 +66,74 @@ fn client(ep: Endpoint<Command, Reply>) {
     let mut oldest_read_tag = 0;
     let mut next_read_tag = 0;
     let mut next_data_tag = 0;
-    let mut paused = false;
+    let mut available_credits; // Note, doesn't apply to Idle and Sync
 
     // Sending idle isn't required but reflects what would happen on hardware
     ep.send(Command::Idle);
 
     // We need to start out in a known state
     ep.send(Command::Sync);
-    while !matches!(ep.receive(), Reply::Synced) {}
+    loop {
+        match ep.receive() {
+            Reply::Synced(credits) => {
+                available_credits = credits;
+                break;
+            }
+            _ => {}
+        }
+    }
 
     println!();
 
     let mut n = 1;
     loop {
-        if !paused && n < 100 && next_read_tag - oldest_read_tag < WINDOW_SIZE {
+        //println!("client: C {available_credits}");
+        let cmd = if n < 100 && next_read_tag - oldest_read_tag < WINDOW_SIZE {
             let is_read = rand::thread_rng().gen_range(0..100) < 66;
             let magic_number = rand::thread_rng().gen_range(1..6);
             let length = 1 << (magic_number / 2);
             let a = rand::thread_rng().gen_range(1..1000u64);
             if is_read {
-                assert!(pending_reads[next_read_tag % WINDOW_SIZE].is_none()); // Can't happen
-                pending_reads[next_read_tag % WINDOW_SIZE] = Some(a);
-                next_read_tag += 1;
-                pending_reads_count += 1;
-                ep.send(Command::Read(length, a));
-                n += 1;
+                /* XXX compressed address */
+                if available_credits < 1 + 8 {
+                    Command::Idle
+                } else {
+                    assert!(pending_reads[next_read_tag % WINDOW_SIZE].is_none()); // Can't happen
+                    pending_reads[next_read_tag % WINDOW_SIZE] = Some(a);
+                    next_read_tag += 1;
+                    pending_reads_count += 1;
+                    available_credits -= 1 + 8;
+                    n += 1;
+                    Command::Read(length, a)
+                }
             } else {
-                ep.send(Command::Write(a, vec![1u8; length.into()]));
+                /* XXX compressed address */
+                if available_credits < length + 1 + 8 {
+                    Command::Idle
+                } else {
+                    available_credits -= length + 1 + 8;
+                    Command::Write(a, vec![1u8; length.into()])
+                }
             }
         } else if pending_reads_count == 0 {
-            ep.send(Command::EndSim);
-            return;
+            Command::EndSim
         } else {
-            ep.send(Command::Idle);
-        }
+            Command::Idle
+        };
+
+        ep.send(cmd);
 
         // Handle replies
         match ep.receive() {
-            Reply::Idle => {}
-            Reply::Synced => {
+            Reply::Idle(back_credits) => available_credits += back_credits,
+            Reply::Synced(credits) => {
+                available_credits = credits;
                 pending_reads = vec![None; WINDOW_SIZE];
                 pending_reads_count = 0;
                 oldest_read_tag = 0;
                 next_read_tag = 0;
                 next_data_tag = 0;
-                paused = false;
             }
-            Reply::Pause => paused = true,
-            Reply::Resume => paused = false,
             Reply::Data(delta, data) => {
                 let this = next_data_tag + delta as i32;
                 match pending_reads[this as usize % WINDOW_SIZE] {
@@ -147,12 +166,18 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
     let mut oldest_read_tag = 0;
     let mut next_read_tag = 0;
     let mut next_data_tag = 0;
+    let mut free_credits = 128usize; // XXX Whatever the buffer size is
+    let mut back_credits = 0;
 
     // Sending idle isn't required but reflects what would happen on hardware
-    ep.send(Reply::Idle);
+    ep.send(Reply::Idle(0));
 
-    let mut pausing = false;
     'outer: loop {
+        // XXX Simple model of credits as replentishing 3 per cycle
+        if back_credits + free_credits < 128 {
+            back_credits += 3;
+        }
+
         // Handle new commands
         match ep.receive() {
             Command::Idle => {}
@@ -162,10 +187,15 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
                 oldest_read_tag = 0;
                 next_read_tag = 0;
                 next_data_tag = 0;
-                ep.send(Reply::Synced);
+                ep.send(Reply::Synced(free_credits as u8));
             }
-            Command::Write(_a, _d) => {}
+            Command::Write(_a, d) => {
+                assert!(1 + 8 + d.len() <= free_credits);
+                free_credits -= 1 + 8 + d.len();
+            }
             Command::Read(width, addr) => {
+                assert!(1 + 8 <= free_credits);
+                free_credits -= 1 + 8;
                 assert!(next_data_tag - oldest_read_tag != WINDOW_SIZE); // XXX Window overflowing is a flow-control failure
                 assert!(pending_reads[next_read_tag % WINDOW_SIZE].is_none()); // Can't happen
                 pending_reads[next_read_tag % WINDOW_SIZE] = Some((width, addr));
@@ -173,13 +203,6 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
                 pending_reads_count += 1;
             }
             Command::EndSim => return,
-        }
-
-        // Control Flow (XXX not correct yet)
-        let magic_number = rand::thread_rng().gen_range(1..14000);
-        if magic_number == 7 {
-            ep.send(if pausing { Reply::Resume } else { Reply::Pause });
-            pausing = !pausing;
         }
 
         // Service pending reads
@@ -214,7 +237,9 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
             }
             panic!("Found no reads? {pending_reads:?} {target_index} {oldest_read_tag}");
         } else {
-            ep.send(Reply::Idle);
+            ep.send(Reply::Idle(back_credits as u8));
+            free_credits += back_credits;
+            back_credits = 0;
         }
     }
 }

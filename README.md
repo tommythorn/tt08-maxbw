@@ -8,12 +8,13 @@
 MaxBW is a PCIe/Hypertransport inspired split transaction packetized
 memory bus with the following characteristics
 
-* fully asynchronous (no fixed latency between commands and replies)
+* optimal pin usage; all of used for data, none for protocol
 * minimal overhead (one byte header for commands and replies)
+* fully asynchronous (no fixed latency between commands and replies)
 * self-synchronizing (idle channels always transmits aligned idle
   packets)
 * supports reply reordering (within a small window)
-* flow-control via pause/resume (AKA Xoff/Xon) replies
+* credit based flow-control
 * address prefix compression
 
 Best case: 64/65 = 98.5% efficient for 64 byte cache loads on byte
@@ -23,7 +24,7 @@ Worst case: 25% efficient on byte loads on 32 bit aligned channels
 
 Commands: Idle, Sync, Write(width,addr,data), Read(width,addr)
 
-Replies: Idle, Synced, Pause, Resume, Data(seqdelta,data)
+Replies: Idle(credit), Synced(total_credit), Data(seqdelta,data)
 
 ## Packet Transport
 
@@ -55,13 +56,19 @@ replies (thus 66*4=264 MB/s at 66 MHz).
 ## Packet Protocol
 
 There are four commands: Idle, Sync, Write(size,address,data), and
-Read(size,address).  Write messages are unacknowledged.  Read command
-are, eventually, fulfilled by a Data reply with read data as the
-payload.  To support reply reordering, Data replies include a small
-reorder delta.  Sync is a barrier for all read and write commands
-which block until all preceeding commands have been processed.
+Read(size,address).  Writes are unacknowledged.  Read command are,
+eventually, fulfilled by a Data reply with read data as the payload.
+To support reply reordering, Data replies include a small reorder
+delta.  Sync is a barrier for all read and write commands which block
+until all preceeding commands have been processed.
 
-Replies are: Idle, Synced, Pause, Resume, and Data(delta,payload).
+Replies are: Idle(credits), Synced(total_credits), and
+Data(delta,payload).  Synced includes the total credits (in bytes),
+Idle include credits returned.  Sender subtracts packet size from his
+credits and cannot allow credits to go negative.
+
+Packet size is sum of header byte, length compressed address, length
+of data (in the case of Write).
 
 
 ## Reply Header Encoding
@@ -70,9 +77,12 @@ Reply headers are 8-bit encoded as two packed fields: `type:5
 datasz:3`.  The datasz maps to 0, 1, 2, 4, .., 64 bytes of following
 data payload.
 
-Type is one of Idle, Synced, Pause, Resume, Data(tagdelta), for
-tagdelta in -16..15.  As Data isn't valid for a payload of 0, Idle,
-Synced, Pause, and Resume are mapped onto the tagdelta.
+XXX This needs to be re-mapped to account for the credits associated
+with Idle and Synced replies.
+
+Type is one of Idle, Synced, Data(tagdelta), for tagdelta in -16..15.
+As Data isn't valid for a payload of 0, Idle, Synced are mapped onto
+the tagdelta.
 
 To enable reply reordering, commands and replies are tagged, but
 implicitly to optimize header density.  The first package after a Sync
@@ -91,8 +101,6 @@ In summany, the header mapping:
 |-------------|---------------------------------|
 | 0           | Idle                            |
 | 1           | Synced                          |
-| 2           | Pause                           |
-| 3           | Resume                          |
 | ...         |                                 |
 | 32          | 1B Data, in-order (tag delta 0) |
 | 33          | 1B Data, tag delta 1            |
