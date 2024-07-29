@@ -1,9 +1,10 @@
 //! Model of the MaxBW protocol
 //!
 //! Todo:
-//! - Flow control (to avoid overrunning buffer space and delta range)
 //! - Message serialization
+//! - Revisit Flow control
 //! - Better code structure + unit tests
+//! - Include a simpler client
 
 //mod encoding;
 use rand::Rng;
@@ -68,10 +69,11 @@ fn client(ep: Endpoint<Command, Reply>) {
     let mut next_data_tag = 0;
     let mut available_credits; // Note, doesn't apply to Idle and Sync
 
-    // Sending idle isn't required but reflects what would happen on hardware
+    // To fully synchronize with a server in unknown state, we need to
+    // idle for as long as the longest package ...
     ep.send(Command::Idle);
 
-    // We need to start out in a known state
+    // ... and then send a sync
     ep.send(Command::Sync);
     loop {
         match ep.receive() {
@@ -115,11 +117,14 @@ fn client(ep: Endpoint<Command, Reply>) {
                     Command::Write(a, vec![1u8; length.into()])
                 }
             }
-        } else if pending_reads_count == 0 {
-            Command::EndSim
         } else {
             Command::Idle
         };
+
+        if n == 100 && pending_reads_count == 0 {
+            ep.send(Command::EndSim);
+            return;
+        }
 
         ep.send(cmd);
 
@@ -196,7 +201,9 @@ fn memory_server(ep: Endpoint<Reply, Command>) {
             Command::Read(width, addr) => {
                 assert!(1 + 8 <= free_credits);
                 free_credits -= 1 + 8;
-                assert!(next_data_tag - oldest_read_tag != WINDOW_SIZE); // XXX Window overflowing is a flow-control failure
+
+                // XXX Window overflowing is a flow-control failure
+                assert!(next_data_tag - oldest_read_tag != WINDOW_SIZE);
                 assert!(pending_reads[next_read_tag % WINDOW_SIZE].is_none()); // Can't happen
                 pending_reads[next_read_tag % WINDOW_SIZE] = Some((width, addr));
                 next_read_tag += 1;
