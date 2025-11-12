@@ -1,5 +1,9 @@
 ![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
 
+# Status
+
+TNT was not able to bring this up so delays may have been too small (was always a risk due to lack of timing analysis), but as of 20251112 a tt08 board is on its way to for my own bringup.
+
 # A simple asynchronous multiplier example
 
 This design emits a sequence of `r` = x^2+x, for x=0,1,2,... on the
